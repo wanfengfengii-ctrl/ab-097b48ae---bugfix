@@ -136,7 +136,7 @@ def run_core(loaded: LoadedSet, manifest: dict, req: dict) -> dict:
 
     loaded.load_revocation()
     engine = RevocationEngine(
-        crls=loaded.crls, ocsps=loaded.ocsps, cert_loader=graph,
+        loader=loaded, cert_loader=graph,
         anchors_by_name_key={}, signed_at=req["signed_at_epoch"],
         cutoff=req["knowledge_cutoff_epoch"])
     finder = PathFinder(graph, anchors, engine.evaluate,

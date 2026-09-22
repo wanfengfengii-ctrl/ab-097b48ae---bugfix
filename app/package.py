@@ -64,13 +64,11 @@ def _collect_references(result: dict) -> dict[str, set[str]]:
 
 def build_package(store, result: dict, set_manifest: dict | None = None) -> bytes:
     refs = _collect_references(result)
-    # Every CRL/OCSP object in the sealed set is bundled (max 2,000 by policy),
-    # so independent recomputation sees exactly the same evidence universe.
-    if set_manifest is not None:
-        for item in set_manifest["content"].get("crls", []):
-            refs["crls"].add(item["sha256"])
-        for item in set_manifest["content"].get("ocsps", []):
-            refs["ocsps"].add(item["sha256"])
+    # Revocation evidence is bundled lazily: only objects the adjudication
+    # actually materialized are needed to independently reproduce it.
+    # Unrelated CRLs/OCSPs (different issuer/AKI/distribution point or no
+    # matching CertID serial) are never parsed and never included; the sealed
+    # manifest inside still enumerates the full content universe.
     req = result["adjudication"]["request"]
     manifest = {
         "evidence_set_id": result["adjudication"]["evidence_set_id"],

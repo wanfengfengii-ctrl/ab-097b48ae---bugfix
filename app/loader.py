@@ -1,11 +1,24 @@
 """Materialize a sealed evidence set into lazily parsed indexes.
 
-Certificates are parsed on first access (the acceptance load has 100k certs
-but adjudicates a handful of leaves); revocation objects are parsed eagerly
-(max 2,000) since the limits make that cheap and they are always needed for
-evidence logging.
+Both certificates and revocation objects stay lazy:
+
+* certificates are parsed only when graph search reaches them (the
+  acceptance load has 100k certs but adjudicates a handful of leaves);
+* CRL/OCSP objects are not fully parsed up front either.  A zero-crypto
+  scope header (issuer Name, AKI, IDP scope, delta linkage, response
+  serials) is extracted once at seal time into a sidecar, so a fresh
+  process adjudicating a small chain never reads or parses unrelated
+  revocation DER — e.g. dozens of CRLs archived for an unrelated CA.
+
+Only revocation evidence whose scope relates to a certificate actually
+reached by path construction (issuer Name/AKI, distribution point or an
+OCSP CertID serial) is materialized with the full cryptographic parser.
 """
 from __future__ import annotations
+
+import base64
+import json
+import os
 
 from . import evidence as ev
 from .certmodel import ParsedCert, parse_certificate
@@ -21,6 +34,13 @@ class LoadedSet:
         self._parsed: dict[str, ParsedCert] = {}
         self.crls: dict[str, ev.CrlObject] = {}
         self.ocsps: dict[str, ev.OcspObject] = {}
+        # Fully-parsed objects that were structurally/profile rejected.
+        self._crl_rejected: set[str] = set()
+        self._ocsp_rejected: set[str] = set()
+        # Cheap scope descriptors (digest -> scope), sorted lists derived.
+        self._crl_scopes: dict[str, ev.CrlScope] = {}
+        self._ocsp_scopes: dict[str, ev.OcspScope] = {}
+        self._scopes_loaded = False
         self.parse_problems: list[dict] = []
 
     @classmethod
@@ -125,10 +145,6 @@ class LoadedSet:
     def _subject_name_index(self) -> dict[bytes, list[str]]:
         """Use the cheap index materialized at seal time (raw Name DER keys,
         base64 encoded in the sidecar file)."""
-        import base64
-        import json
-        import os
-
         cached = getattr(self, "_name_idx", None)
         if cached is not None:
             return cached
@@ -149,34 +165,137 @@ class LoadedSet:
         return idx
 
     def _name_index_path(self) -> str:
-        import os
-
         return os.path.join(self.store.root, "packages",
                             f"{self.manifest['evidence_set_id']}.nameindex.json")
 
     # --------------------------------------------------------- revocation
-    def load_revocation(self) -> None:
+    def _earliest_received(self, items) -> dict[str, int]:
         # Identical bytes archived multiple times: evidence is possessed at
         # the earliest recorded received_at.
-        def _earliest(items):
-            m: dict[str, int] = {}
-            for item in items:
-                d, r = item["sha256"], item["received_at"]
-                m[d] = r if d not in m else min(m[d], r)
-            return m
-        for digest, received_at in _earliest(self.content["crls"]).items():
-            try:
-                raw = self.get_blob(digest)
-                self.crls[digest] = ev.parse_crl(raw, received_at)
-            except (UnsupportedError, MalformedEvidenceError) as exc:
-                self.parse_problems.append({
-                    "sha256": digest, "kind": "crl",
-                    "code": exc.code, "message": exc.message, "detail": exc.detail})
-        for digest, received_at in _earliest(self.content["ocsps"]).items():
-            try:
-                raw = self.get_blob(digest)
-                self.ocsps[digest] = ev.parse_ocsp(raw, received_at)
-            except (UnsupportedError, MalformedEvidenceError) as exc:
-                self.parse_problems.append({
-                    "sha256": digest, "kind": "ocsp",
-                    "code": exc.code, "message": exc.message, "detail": exc.detail})
+        m: dict[str, int] = {}
+        for item in items:
+            d, r = item["sha256"], item["received_at"]
+            m[d] = r if d not in m else min(m[d], r)
+        return m
+
+    def _rev_index_path(self) -> str:
+        return os.path.join(self.store.root, "packages",
+                            f"{self.manifest['evidence_set_id']}.revindex.json")
+
+    def load_revocation(self) -> None:
+        """Populate cheap scope descriptors without parsing any DER.
+
+        Uses the seal-time sidecar when present (no blob reads at all for
+        unrelated evidence); otherwise falls back to a zero-crypto header
+        scan over the raw DER (older stores / offline packages).
+        """
+        if self._scopes_loaded:
+            return
+        crl_received = self._earliest_received(self.content["crls"])
+        ocsp_received = self._earliest_received(self.content["ocsps"])
+        sidecar = self._read_rev_sidecar()
+        if sidecar is not None:
+            for digest, header_raw in sidecar.get("crls", {}).items():
+                if digest not in crl_received:
+                    continue
+                header = self._crl_header_from_json(header_raw)
+                self._crl_scopes[digest] = ev.CrlScope(
+                    digest, crl_received[digest], header)
+            for digest, serials in sidecar.get("ocsps", {}).items():
+                if digest not in ocsp_received:
+                    continue
+                self._ocsp_scopes[digest] = ev.OcspScope(
+                    digest, ocsp_received[digest],
+                    frozenset(serials) if serials is not None else None)
+        else:
+            for digest, received_at in crl_received.items():
+                header = None
+                try:
+                    header = ev.crl_scope_header(self.get_blob(digest))
+                except MalformedEvidenceError:
+                    header = None
+                self._crl_scopes[digest] = ev.CrlScope(digest, received_at, header)
+            for digest, received_at in ocsp_received.items():
+                serials = None
+                try:
+                    serials = frozenset(ev.ocsp_scope_serials(self.get_blob(digest)))
+                except (MalformedEvidenceError, UnsupportedError):
+                    serials = None
+                self._ocsp_scopes[digest] = ev.OcspScope(digest, received_at, serials)
+
+        # Defensive: sidecar could only be older than the manifest; make sure
+        # every manifest object has a descriptor even if the sidecar missed it.
+        for digest, received_at in crl_received.items():
+            self._crl_scopes.setdefault(
+                digest, ev.CrlScope(digest, received_at, None))
+        for digest, received_at in ocsp_received.items():
+            self._ocsp_scopes.setdefault(
+                digest, ev.OcspScope(digest, received_at, None))
+        self._scopes_loaded = True
+
+    def _read_rev_sidecar(self) -> dict | None:
+        path = self._rev_index_path()
+        if not path or not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    @staticmethod
+    def _crl_header_from_json(raw: dict | None) -> dict | None:
+        if raw is None:
+            return None
+        return {
+            "issuer_der": base64.b64decode(raw["issuer_der_b64"]),
+            "aki": (base64.b64decode(raw["aki_b64"])
+                    if raw.get("aki_b64") is not None else None),
+            "crl_number": raw["crl_number"],
+            "base_crl_number": raw["base_crl_number"],
+            "idp_uris": tuple(raw["idp_uris"]),
+            "only_user_certs": raw["only_user_certs"],
+            "only_ca_certs": raw["only_ca_certs"],
+            "entry_count": raw["entry_count"],
+        }
+
+    def crl_scopes(self) -> list[ev.CrlScope]:
+        self.load_revocation()
+        return [self._crl_scopes[d] for d in sorted(self._crl_scopes)]
+
+    def ocsp_scopes(self) -> list[ev.OcspScope]:
+        self.load_revocation()
+        return [self._ocsp_scopes[d] for d in sorted(self._ocsp_scopes)]
+
+    def materialize_crl(self, scope: ev.CrlScope) -> ev.CrlObject | None:
+        """Full parse of one in-scope CRL (cached per adjudication)."""
+        digest = scope.fingerprint
+        if digest in self.crls:
+            return self.crls[digest]
+        if digest in self._crl_rejected:
+            return None
+        try:
+            obj = ev.parse_crl(self.get_blob(digest), scope.received_at)
+        except (UnsupportedError, MalformedEvidenceError) as exc:
+            self._crl_rejected.add(digest)
+            self.parse_problems.append({
+                "sha256": digest, "kind": "crl",
+                "code": exc.code, "message": exc.message, "detail": exc.detail})
+            return None
+        self.crls[digest] = obj
+        return obj
+
+    def materialize_ocsp(self, scope: ev.OcspScope) -> ev.OcspObject | None:
+        """Full parse of one in-scope OCSP response (cached per adjudication)."""
+        digest = scope.fingerprint
+        if digest in self.ocsps:
+            return self.ocsps[digest]
+        if digest in self._ocsp_rejected:
+            return None
+        try:
+            obj = ev.parse_ocsp(self.get_blob(digest), scope.received_at)
+        except (UnsupportedError, MalformedEvidenceError) as exc:
+            self._ocsp_rejected.add(digest)
+            self.parse_problems.append({
+                "sha256": digest, "kind": "ocsp",
+                "code": exc.code, "message": exc.message, "detail": exc.detail})
+            return None
+        self.ocsps[digest] = obj
+        return obj

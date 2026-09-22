@@ -219,6 +219,136 @@ def main() -> int:
                 check("offline verifier passes without network",
                       offline_ok, str(fails)[:300])
 
+    # --------------------- lazy revocation scope (noise set) --------------
+    # A sealed set with the target chain plus 48 valid CRLs archived for an
+    # unrelated "Noise CA". No fresh-process or cache-miss adjudication may
+    # fully parse the noise CRLs; the evidence package bundles exactly the
+    # materialized subset, so its member list is the externally observable
+    # parse set.
+    import io as _io
+    import zipfile as _zipfile
+
+    nrk, nck, nlk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    nroot = pf.build_cert("Scope Root", None, nrk, nrk, is_ca=True,
+                          key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                          self_signed=True)
+    nca = pf.build_cert("Scope CA", nroot, nck, nrk, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    nleaf = pf.build_cert("scope.artifact.test", nca, nlk, nck,
+                          key_usage=("digitalSignature",),
+                          eku=("codeSigning",), policies=[ANY],
+                          san_dns=("scope.artifact.test",))
+    ncrl = pf.build_crl(nca, nck, [], last_update=SIGNED - 100,
+                        next_update=SIGNED + 100, crl_number=2)
+    nrcrl = pf.build_crl(nroot, nrk, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1)
+    N_NOISE = 48
+    noise_fps = set()
+    noise_items = []
+    for i in range(N_NOISE):
+        nkk = pf.gen_key()
+        noise_ca = pf.build_cert(f"Noise CA {i:02d}", None, nkk, nkk,
+                                 is_ca=True,
+                                 key_usage=("keyCertSign", "cRLSign"),
+                                 policies=[ANY], self_signed=True)
+        noise_crl = pf.build_crl(noise_ca, nkk, [], last_update=SIGNED - 100,
+                                 next_update=SIGNED + 100, crl_number=1)
+        raw = pf.der(noise_crl)
+        noise_fps.add(fp_of(raw))
+        noise_items.append({"client_ref": f"noise-{i:02d}", "type": "crl",
+                            "content_base64": b64(noise_crl)})
+
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": "scope-create"})
+    scope_sid = r.json()["evidence_set_id"]
+    scope_items = [
+        {"client_ref": ref, "type": "certificate", "content_base64": b64(c)}
+        for ref, c in (("sroot", nroot), ("sca", nca), ("sleaf", nleaf))]
+    scope_items += [
+        {"client_ref": "scrl", "type": "crl", "content_base64": b64(ncrl)},
+        {"client_ref": "srcrl", "type": "crl", "content_base64": b64(nrcrl)}]
+    scope_items += noise_items
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{scope_sid}/items",
+                   json={"client_request_id": "scope-items",
+                         "received_at": RECEIVED, "items": scope_items})
+    check("noise set upload accepts 53 items",
+          r.status_code == 200 and r.json()["accepted"] == 53)
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{scope_sid}/seal",
+                   json={"client_request_id": "scope-seal"})
+    scope_manifest = r.json()["manifest"]
+    check("noise set sealed with 50 CRLs in manifest",
+          r.status_code == 200
+          and scope_manifest["counts"]["crls"] == N_NOISE + 2)
+
+    def _adj_scope(inst, rid, artifact, key):
+        digest = hashlib.sha256(artifact).digest()
+        sig = key.sign(digest, ec.ECDSA(Prehashed(hashes.SHA256())))
+        body = {"client_request_id": rid,
+                "artifact_digest": digest.hex(), "signature": sig.hex(),
+                "signature_algorithm": "1.2.840.10045.4.3.2",
+                "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+                "leaf_certificate_sha256": fp_of(pf.der(nleaf)),
+                "initial_policies": [ANY],
+                "trust_anchors": [fp_of(pf.der(nroot))]}
+        rr = httpx.post(f"{inst}/api/v1/evidence-sets/{scope_sid}/adjudications",
+                        json=body)
+        return rr
+
+    def _pkg_crl_fps(inst, adj_id):
+        rr = httpx.get(f"{inst}/api/v1/evidence-sets/{scope_sid}/packages/{adj_id}")
+        zf = _zipfile.ZipFile(_io.BytesIO(rr.content))
+        return {n.split("/")[-1].removesuffix(".der")
+                for n in zf.namelist() if n.startswith("der/crls/")}, rr.content
+
+    # First adjudication on api2: a different process that has never loaded
+    # this set (covers restart / instance switch / cold cache).
+    r = _adj_scope(API2, "scope-adj-instance2", b"scope-artifact-1", nlk)
+    ok_scope = r.status_code == 201 and r.json()["verdict"]["status"] == "VALID"
+    scope_adj_id = r.json()["adjudication_id"] if r.status_code == 201 else None
+    bundled, pkg_bytes = ({}, b"")
+    if scope_adj_id:
+        bundled, pkg_bytes = _pkg_crl_fps(API2, scope_adj_id)
+    check("fresh-instance adjudication VALID; 48 unrelated CRLs unparsed",
+          ok_scope and bundled == {fp_of(pf.der(ncrl)), fp_of(pf.der(nrcrl))}
+          and not (bundled & noise_fps),
+          f"bundled={len(bundled)} intersect_noise={len(bundled & noise_fps)}")
+
+    # Second, previously uncached adjudication (different artifact digest and
+    # signature => different request digest, no replay) on api1.
+    r = _adj_scope(API1, "scope-adj-cachemiss", b"scope-artifact-2", nlk)
+    ok_miss = r.status_code == 201 and r.json()["verdict"]["status"] == "VALID"
+    miss_id = r.json()["adjudication_id"] if r.status_code == 201 else None
+    bundled_miss = set()
+    if miss_id:
+        bundled_miss, _ = _pkg_crl_fps(API1, miss_id)
+    check("cache-miss adjudication also skips 48 unrelated CRLs",
+          ok_miss and not (bundled_miss & noise_fps)
+          and len(bundled_miss) == 2,
+          f"intersect_noise={len(bundled_miss & noise_fps)}")
+
+    # The lazily bundled package must still verify fully offline.
+    if pkg_bytes:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "scope.zip")
+            with open(path, "wb") as f:
+                f.write(pkg_bytes)
+            env = dict(os.environ)
+            for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy",
+                        "https_proxy", "ALL_PROXY", "all_proxy"):
+                env[var] = "http://127.0.0.1:9"
+            proc = subprocess.run(
+                [sys.executable, "-m", "verify", path, "--json"],
+                capture_output=True, text=True, env=env, timeout=120)
+            try:
+                import json as _json
+                report = _json.loads(proc.stdout)
+                scope_offline_ok = proc.returncode == 0 and report["ok"]
+                fails = [c for c in report["checks"] if not c["ok"]]
+            except Exception:
+                scope_offline_ok, fails = False, [{"check": proc.stderr[:300]}]
+            check("lazy evidence package verifies offline byte-for-byte",
+                  scope_offline_ok, str(fails)[:300])
+
     # --------------------------- structured UNSUPPORTED ------------------
     from cryptography.hazmat.primitives.asymmetric import ec as _ec
 

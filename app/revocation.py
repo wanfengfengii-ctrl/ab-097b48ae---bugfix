@@ -60,15 +60,23 @@ class RevocationEngine:
     the graph/adjudication layer.
     """
 
-    def __init__(self, crls: dict[str, ev.CrlObject], ocsps: dict[str, ev.OcspObject],
-                 cert_loader, anchors_by_name_key, signed_at: int, cutoff: int):
-        self.crls = crls
-        self.ocsps = ocsps
+    def __init__(self, loader, cert_loader, anchors_by_name_key,
+                 signed_at: int, cutoff: int):
+        # Cheap zero-crypto scope descriptors for the whole sealed set.
+        self.loader = loader
+        self.crl_scopes = loader.crl_scopes()
+        self.ocsp_scopes = loader.ocsp_scopes()
         self.load_cert = cert_loader
         self.anchors_by_name_key = anchors_by_name_key  # (name_der, key) -> ParsedCert
         self.signed_at = signed_at
         self.cutoff = cutoff
         self._cache: dict[str, dict] = {}
+
+    def _materialize_crl(self, scope: ev.CrlScope):
+        return self.loader.materialize_crl(scope)
+
+    def _materialize_ocsp(self, scope: ev.OcspScope):
+        return self.loader.materialize_ocsp(scope)
 
     # -------------------------------------------------- signer resolution
     def _issuer_certs(self, name_der: bytes, ski: bytes | None) -> list[ParsedCert]:
@@ -131,34 +139,86 @@ class RevocationEngine:
                 entries[serial] = e
         return entries
 
-    def _crl_candidates(self, cert: ParsedCert):
-        """Yield (combo_key, base, delta|None, entries, scope_reason)."""
+    def _crl_scopes_for(self, cert: ParsedCert) -> tuple[list, list]:
+        """Cheap issuer/AKI prefilter. Returns (base_scopes, delta_scopes).
+
+        A descriptor whose header could not be extracted is treated as a
+        potential match so full parsing still records its rejection.  When such
+        an envelope nevertheless parses, it is routed by its parsed
+        ``is_delta`` flag so a delta is never mistaken for a base.
+        """
         bases, deltas = [], []
-        for crl in self.crls.values():
-            if crl.issuer_der != cert.issuer_der:
-                continue
-            if crl.aki and cert.aki and crl.aki != cert.aki:
-                continue
-            (bases if not crl.is_delta else deltas).append(crl)
-        combos = []
-        for base in bases:
-            chosen_delta = None
-            for d in deltas:
+        for scope in self.crl_scopes:
+            if scope.header is not None:
+                if scope.issuer_der != cert.issuer_der:
+                    continue
+                if scope.aki is not None and cert.aki is not None \
+                        and scope.aki != cert.aki:
+                    continue
+                (deltas if scope.is_delta else bases).append(scope)
+            else:
+                obj = self._materialize_crl(scope)
+                if obj is None:
+                    continue
+                if obj.issuer_der != cert.issuer_der:
+                    continue
+                if obj.aki is not None and cert.aki is not None \
+                        and obj.aki != cert.aki:
+                    continue
+                (deltas if obj.is_delta else bases).append(scope)
+        return bases, deltas
+
+    def _choose_delta_scope(self, base: ev.CrlObject,
+                            delta_scopes: list) -> ev.CrlScope | None:
+        """Pick the header-compatible delta for a materialized base.
+
+        Compatibility mirrors :class:`CrlObject` matching (issuer, AKI, IDP
+        URIs, baseCRLNumber == base cRLNumber, larger number); ties resolve on
+        the largest cRLNumber then the smallest fingerprint.  Deltas that fail
+        full parsing are skipped (as they never entered the parsed universe
+        under eager loading).
+        """
+        candidates = []
+        for d in delta_scopes:
+            if d.header is None:
+                # Header-less descriptor: it was materialized during
+                # prefiltering; compare against its fully parsed fields.
+                parsed_d = self._materialize_crl(d)
+                if parsed_d is None:
+                    continue
                 compatible = (
-                    d.issuer_der == base.issuer_der
-                    and (d.aki or b"") == (base.aki or b"")
-                    and tuple(sorted(d.idp_uris)) == tuple(sorted(base.idp_uris))
-                    and d.base_crl_number == base.crl_number
-                    and (d.crl_number is None or base.crl_number is None
-                         or d.crl_number > base.crl_number)
+                    parsed_d.issuer_der == base.issuer_der
+                    and (parsed_d.aki or b"") == (base.aki or b"")
+                    and tuple(sorted(parsed_d.idp_uris)) == tuple(sorted(base.idp_uris))
+                    and parsed_d.base_crl_number == base.crl_number
+                    and (parsed_d.crl_number is None or base.crl_number is None
+                         or parsed_d.crl_number > base.crl_number)
                 )
-                if compatible and (chosen_delta is None
-                                   or (d.crl_number or -1) > (chosen_delta.crl_number or -1)
-                                   or (d.crl_number == chosen_delta.crl_number
-                                       and d.fingerprint < chosen_delta.fingerprint)):
-                    chosen_delta = d
-            combos.append((base, chosen_delta))
-        return combos
+                if compatible:
+                    candidates.append(d)
+                continue
+            compatible = (
+                d.issuer_der == base.issuer_der
+                and (d.aki or b"") == (base.aki or b"")
+                and tuple(sorted(d.idp_uris)) == tuple(sorted(base.idp_uris))
+                and d.base_crl_number == base.crl_number
+                and (d.crl_number is None or base.crl_number is None
+                     or d.crl_number > base.crl_number)
+            )
+            if compatible:
+                candidates.append(d)
+        # Header-less candidates sort by their parsed cRLNumber; normal
+        # candidates by their cheap header number.
+        def _num(s):
+            if s.header is not None:
+                return s.crl_number or -1
+            obj = self._materialize_crl(s)
+            return (obj.crl_number or -1) if obj is not None else -1
+        candidates.sort(key=lambda s: (-_num(s), s.fingerprint))
+        for d in candidates:
+            if self._materialize_crl(d) is not None:
+                return d
+        return None
 
     def _eval_crl(self, cert: ParsedCert, considered: list[dict]) -> dict | None:
         """Return a decision item dict for the best usable CRL combo, or None."""
@@ -167,10 +227,16 @@ class RevocationEngine:
         scope_candidates = 0
         crypto_failures = 0
         stale_any = False
-        for base, delta in self._crl_candidates(cert):
-            for crl in [base] + ([delta] if delta else []):
-                if crl.fingerprint in {c["fingerprint"] for c in considered}:
-                    continue
+        base_scopes, delta_scopes = self._crl_scopes_for(cert)
+        for base_scope in base_scopes:
+            # Materialize before recording disposition: an envelope that fails
+            # the full parser never entered the considered universe under the
+            # eager implementation (its rejection lives in parse_problems).
+            base = self._materialize_crl(base_scope)
+            if base is None:
+                continue
+            delta_scope = self._choose_delta_scope(base, delta_scopes)
+            delta = self._materialize_crl(delta_scope) if delta_scope else None
             scope_ok, scope_reason = self._crl_scope_ok(base, cert)
             considered.append({
                 "kind": "crl", "fingerprint": base.fingerprint,
@@ -316,15 +382,31 @@ class RevocationEngine:
             return rc, None
         return None, "responder_identity_unresolved"
 
+    def _ocsp_scopes_for(self, cert: ParsedCert) -> list:
+        """Cheap CertID-serial prefilter.
+
+        Only responses carrying this certificate's serial can match it; the
+        cheap scope index lists response serials without crypto parsing.
+        Header-less descriptors (envelope not cheaply walkable) stay
+        candidates so full parsing still records their rejection.
+        """
+        return [s for s in self.ocsp_scopes
+                if s.serials is None or cert.serial in s.serials]
+
     def _eval_ocsp(self, cert: ParsedCert, considered: list[dict]) -> dict | None:
         t = self.signed_at
         usable = []
         scope_candidates = 0
         crypto_failures = 0
         stale_any = False
-        for resp in self.ocsps.values():
+        for scope in self._ocsp_scopes_for(cert):
+            resp = self._materialize_ocsp(scope)
+            if resp is None:
+                continue
             single = resp.responses.get(cert.serial)
             if single is None:
+                # Tolerated edge: cheap scope was unknown but the parsed
+                # response simply does not cover this serial.
                 continue
             considered.append({
                 "kind": "ocsp", "fingerprint": resp.fingerprint,

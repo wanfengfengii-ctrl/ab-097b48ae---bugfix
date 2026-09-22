@@ -278,7 +278,7 @@ class Store:
                 import base64
 
                 from .certmodel import cheap_names
-                from .errors import MalformedEvidenceError
+                from .errors import MalformedEvidenceError, UnsupportedError
 
                 name_index: dict[str, list[str]] = {}
                 for x in groups["certificate"]:
@@ -288,12 +288,50 @@ class Store:
                     except MalformedEvidenceError:
                         continue
                     name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
+                # Cheap revocation scope index (zero-crypto): issuer Name/AKI,
+                # IDP scope and delta linkage for CRLs, response serials for
+                # OCSP. Lets fresh-process adjudication skip unrelated
+                # revocation DER entirely.
+                from . import evidence as _ev
+
+                rev_index = {"crls": {}, "ocsps": {}}
                 total_revocation_entries = 0
                 for x in groups["crl"]:
-                    from cryptography import x509 as _x509
+                    d = x["sha256"]
+                    raw = self.get_blob(d)
+                    try:
+                        header = _ev.crl_scope_header(raw)
+                    except MalformedEvidenceError:
+                        header = None
+                    if header is None:
+                        # Preserve the legacy seal-time rejection of an
+                        # unparseable CRL envelope; resource counting falls
+                        # back to the library parser.
+                        from cryptography import x509 as _x509
 
-                    total_revocation_entries += len(
-                        _x509.load_der_x509_crl(self.get_blob(x["sha256"])))
+                        total_revocation_entries += len(_x509.load_der_x509_crl(raw))
+                        rev_index["crls"][d] = None
+                        continue
+                    total_revocation_entries += header["entry_count"]
+                    rev_index["crls"][d] = {
+                        "issuer_der_b64": base64.b64encode(
+                            header["issuer_der"]).decode(),
+                        "aki_b64": (base64.b64encode(header["aki"]).decode()
+                                    if header["aki"] is not None else None),
+                        "crl_number": header["crl_number"],
+                        "base_crl_number": header["base_crl_number"],
+                        "idp_uris": list(header["idp_uris"]),
+                        "only_user_certs": header["only_user_certs"],
+                        "only_ca_certs": header["only_ca_certs"],
+                        "entry_count": header["entry_count"],
+                    }
+                for x in groups["ocsp"]:
+                    d = x["sha256"]
+                    try:
+                        serials = _ev.ocsp_scope_serials(self.get_blob(d))
+                        rev_index["ocsps"][d] = serials
+                    except (MalformedEvidenceError, UnsupportedError):
+                        rev_index["ocsps"][d] = None
                 if total_revocation_entries > 1_000_000:
                     raise ConflictError("resource limit exceeded",
                                         {"limit": "revocation_entries", "max": 1_000_000,
@@ -328,6 +366,12 @@ class Store:
                 with open(tmp, "w") as f:
                     f.write(canonical.dumps(name_index).decode("utf-8"))
                 _os.replace(tmp, idx_path)
+                # Revocation scope index sidecar.
+                rev_path = _os.path.join(self.root, "packages", f"{set_id}.revindex.json")
+                tmp = rev_path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(canonical.dumps(rev_index).decode("utf-8"))
+                _os.replace(tmp, rev_path)
                 return manifest
             except Exception:
                 self._conn.rollback()

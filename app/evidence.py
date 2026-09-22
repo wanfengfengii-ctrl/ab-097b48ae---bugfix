@@ -22,11 +22,13 @@ from . import der
 from .certmodel import OID_EKU_OCSP_SIGNING, _hash, fp_of
 from .errors import MalformedEvidenceError, UnsupportedError
 
-OID_DELTA_CRL_INDICATOR = "2.5.29.31.27"
+OID_DELTA_CRL_INDICATOR = "2.5.29.27"
 OID_CRL_NUMBER = "2.5.29.20"
-OID_ISSUING_DP = "2.5.29.28.7"
+OID_ISSUING_DP = "2.5.29.28"
 OID_FRESHEST_CRL = "2.5.29.46"
 OID_OCSP_NO_CHECK = "1.3.6.1.5.5.7.48.1.5"
+OID_AKI = "2.5.29.35"
+OID_BASIC_OCSP = "1.3.6.1.5.5.7.48.1.1"
 
 # Reason flags relevant to revocation decisions.
 _REASON_CODES = {
@@ -107,6 +109,64 @@ class SingleOcsp:
     next_update: int | None
 
 
+@dataclasses.dataclass
+class CrlScope:
+    """Cheap scope descriptor of a sealed CRL (zero-crypto extraction).
+
+    ``header`` is None when even the envelope could not be walked; such an
+    object cannot be safely prefiltered and stays a candidate for every
+    certificate, so full parsing still records its rejection.
+    """
+
+    fingerprint: str
+    received_at: int
+    header: dict | None
+
+    @property
+    def issuer_der(self) -> bytes | None:
+        return None if self.header is None else self.header["issuer_der"]
+
+    @property
+    def aki(self) -> bytes | None:
+        return None if self.header is None else self.header["aki"]
+
+    @property
+    def crl_number(self) -> int | None:
+        return None if self.header is None else self.header["crl_number"]
+
+    @property
+    def base_crl_number(self) -> int | None:
+        return None if self.header is None else self.header["base_crl_number"]
+
+    @property
+    def idp_uris(self) -> tuple[str, ...]:
+        return () if self.header is None else self.header["idp_uris"]
+
+    @property
+    def only_user_certs(self) -> bool:
+        return False if self.header is None else self.header["only_user_certs"]
+
+    @property
+    def only_ca_certs(self) -> bool:
+        return False if self.header is None else self.header["only_ca_certs"]
+
+    @property
+    def is_delta(self) -> bool:
+        # A header-less descriptor is materialized before this is read.
+        return self.header is not None and self.base_crl_number is not None
+
+
+@dataclasses.dataclass
+class OcspScope:
+    """Cheap scope descriptor of a sealed OCSP response."""
+
+    fingerprint: str
+    received_at: int
+    # Serial numbers carried by the response; None when the envelope could
+    # not be cheaply walked (candidate for every certificate).
+    serials: frozenset[int] | None
+
+
 def _crl_sig_parts(raw: bytes):
     # CertificateList ::= SEQUENCE { tbsCertList, signatureAlgorithm, signatureValue }
     tag, body, _ = der.tlv(raw)
@@ -182,9 +242,9 @@ def parse_crl(raw: bytes, received_at: int) -> CrlObject:
             # represented, entries outside the subset would be authoritative
             # for their reasons. Profile keeps full-scope CRLs only.
             raise UnsupportedError("CRL with onlySomeReasons partition is outside profile")
-        if idp.distribution_point is not None and idp.distribution_point.full_name:
+        if idp.full_name:
             uris = []
-            for gn in idp.distribution_point.full_name:
+            for gn in idp.full_name:
                 if isinstance(gn, x509.UniformResourceIdentifier):
                     uris.append(gn.value.lower())
                 else:
@@ -443,3 +503,189 @@ def certid_hashes(name_der: bytes, spki_key_bytes: bytes, alg: str) -> tuple[byt
     nh.update(name_der)
     kh.update(spki_key_bytes)
     return nh.finalize(), kh.finalize()
+
+
+# ---------------------------------------------------------------------------
+# Zero-crypto scope headers
+#
+# Adjudication must not fully parse revocation DER that cannot possibly be
+# relevant to any certificate under evaluation.  The functions below walk the
+# raw DER with the minimal TLV reader and extract only the fields the
+# revocation engine needs to decide *relevance* (issuer Name, AKI, IDP scope,
+# delta linkage, response serials).  No signature algorithm profile checks,
+# no time parsing, no revoked-entry iteration — those stay in ``parse_crl`` /
+# ``parse_ocsp``, which run only for in-scope objects.
+
+
+def _exts_iter(exts_body: bytes):
+    """Yield (oid, critical, value_bytes) for a CRL Extensions SEQUENCE body."""
+    for tag, ext_seq in der.iter_tlv(exts_body):
+        if tag != der.SEQUENCE:
+            raise MalformedEvidenceError("CRL extensions: bad extension")
+        parts = list(der.iter_tlv(ext_seq))
+        if len(parts) < 2 or parts[0][0] != der.OID:
+            raise MalformedEvidenceError("CRL extensions: bad extension fields")
+        oid = der.decode_oid(parts[0][1])
+        idx = 1
+        critical = False
+        if parts[idx][0] == der.BOOLEAN:
+            critical = parts[idx][1] != b"\x00"
+            idx += 1
+        if idx >= len(parts) or parts[idx][0] != der.OCTET_STRING:
+            raise MalformedEvidenceError("CRL extensions: bad extnValue")
+        yield oid, critical, parts[idx][1]
+
+
+def _int_value(value: bytes) -> int:
+    return int.from_bytes(value, "big", signed=False)
+
+
+def crl_scope_header(raw: bytes) -> dict:
+    """Cheaply extract the scope-relevant header of a CRL from raw DER.
+
+    Returns a dict with: ``issuer_der`` (raw Name TLV), ``aki`` (key
+    identifier or None), ``crl_number``, ``base_crl_number`` (delta CRL
+    indicator), ``idp_uris`` (sorted lowercase URI full names), the
+    ``only_user_certs``/``only_ca_certs`` IDP flags and ``entry_count``
+    (number of revokedCertificate SEQUENCEs).  Raises
+    :class:`MalformedEvidenceError` when the outer structure is not a
+    well-formed CRL envelope.
+    """
+    tag, body, _ = der.tlv(raw)
+    if tag != der.SEQUENCE:
+        raise MalformedEvidenceError("CRL: expected SEQUENCE")
+    elems = list(der.iter_tlv(body))
+    if len(elems) != 3 or elems[0][0] != der.SEQUENCE:
+        raise MalformedEvidenceError("CRL: bad structure")
+    tbs = list(der.iter_tlv(elems[0][1]))
+    # TBSCertList: version is a plain INTEGER (unlike TBSCertificate's [0]).
+    i = 1 if tbs and tbs[0][0] == der.INTEGER else 0  # optional v2 version
+    # signature i, issuer i+1, thisUpdate i+2, nextUpdate? i+3,
+    # revokedCertificates? (SEQUENCE), extensions? ([0] EXPLICIT)
+    if len(tbs) < i + 3 or tbs[i + 1][0] != der.SEQUENCE:
+        raise MalformedEvidenceError("CRL: truncated tbsCertList")
+    issuer_der = der.build_tlv(tbs[i + 1][0], tbs[i + 1][1])
+    j = i + 3  # thisUpdate consumed; optional nextUpdate follows
+    if j < len(tbs) and tbs[j][0] in (der.UTC_TIME, der.GENERALIZED_TIME):
+        j += 1
+    entry_count = 0
+    if j < len(tbs) and tbs[j][0] == der.SEQUENCE:
+        entry_count = sum(1 for _ in der.iter_tlv(tbs[j][1]))
+        j += 1
+    aki = None
+    crl_number = None
+    base_crl_number = None
+    idp_uris: tuple[str, ...] = ()
+    only_user = only_ca = False
+    if j < len(tbs) and tbs[j][0] == 0xA0:
+        _etag, exts_body, _ = der.tlv(tbs[j][1])
+        for oid, _critical, value in _exts_iter(exts_body):
+            if oid == OID_AKI:
+                atag, abody, _ = der.tlv(value)
+                if atag != der.SEQUENCE:
+                    raise MalformedEvidenceError("CRL AKI: bad structure")
+                for t2, v2 in der.iter_tlv(abody):
+                    if t2 == 0x80:  # [0] keyIdentifier
+                        aki = v2
+                        break
+            elif oid == OID_CRL_NUMBER:
+                itag, ival, _ = der.tlv(value)
+                if itag != der.INTEGER:
+                    raise MalformedEvidenceError("CRL number: bad structure")
+                crl_number = _int_value(ival)
+            elif oid == OID_DELTA_CRL_INDICATOR:
+                itag, ival, _ = der.tlv(value)
+                if itag != der.INTEGER:
+                    raise MalformedEvidenceError("delta CRL indicator: bad structure")
+                base_crl_number = _int_value(ival)
+            elif oid == OID_ISSUING_DP:
+                idp_uris, only_user, only_ca = _idp_scope(value)
+    return {
+        "issuer_der": issuer_der,
+        "aki": aki,
+        "crl_number": crl_number,
+        "base_crl_number": base_crl_number,
+        "idp_uris": idp_uris,
+        "only_user_certs": only_user,
+        "only_ca_certs": only_ca,
+        "entry_count": entry_count,
+    }
+
+
+def _idp_scope(value: bytes) -> tuple[tuple[str, ...], bool, bool]:
+    """Extract (URI full names, only_user, only_ca) from an
+    IssuingDistributionPoint extension value.  Non-URI distribution point
+    names are ignored here; full parsing re-validates them when the CRL is
+    actually materialized for an in-scope certificate."""
+    tag, body, _ = der.tlv(value)
+    if tag != der.SEQUENCE:
+        raise MalformedEvidenceError("IDP: expected SEQUENCE")
+    uris: list[str] = []
+    only_user = only_ca = False
+    for t, v in der.iter_tlv(body):
+        if t == 0xA0:  # [0] distributionPoint
+            dt, dv, _ = der.tlv(v)
+            if dt == 0xA0:  # [0] fullName
+                for gt, gv in der.iter_tlv(dv):
+                    if gt == 0x86:  # [6] uniformResourceIdentifier (IA5String)
+                        try:
+                            uris.append(gv.decode("ascii").lower())
+                        except UnicodeDecodeError as exc:
+                            raise MalformedEvidenceError(
+                                "IDP: non-ASCII distribution point URI") from exc
+        elif t == 0x81:  # [1] onlyContainsUserCerts
+            only_user = v != b"\x00"
+        elif t == 0x82:  # [2] onlyContainsCACerts
+            only_ca = v != b"\x00"
+    return tuple(sorted(uris)), only_user, only_ca
+
+
+def ocsp_scope_serials(raw: bytes) -> list[int]:
+    """Cheaply extract the serial numbers of every SingleResponse in a
+    successful basic OCSP response, without crypto parsing.
+
+    Raises :class:`MalformedEvidenceError` for a non-successful response
+    status, a non-basic response or a broken envelope: those objects are
+    outside the scope filter and must be fully parsed so their rejection is
+    recorded.  A well-formed empty response simply returns ``[]``.
+    """
+    tag, body, _ = der.tlv(raw)
+    if tag != der.SEQUENCE:
+        raise MalformedEvidenceError("OCSP: expected SEQUENCE")
+    elems = list(der.iter_tlv(body))
+    if not elems or elems[0][0] != der.ENUMERATED:
+        raise MalformedEvidenceError("OCSP: missing responseStatus")
+    if elems[0][1] != b"\x00":
+        raise MalformedEvidenceError("OCSP response not successful")
+    if len(elems) < 2 or elems[1][0] != 0xA0:
+        raise MalformedEvidenceError("OCSP: missing responseBytes")
+    _t, rb, _ = der.tlv(elems[1][1])
+    rb_parts = list(der.iter_tlv(rb))
+    if len(rb_parts) < 2 or rb_parts[0][0] != der.OID or \
+            rb_parts[1][0] != der.OCTET_STRING:
+        raise MalformedEvidenceError("OCSP: bad responseBytes")
+    if der.decode_oid(rb_parts[0][1]) != OID_BASIC_OCSP:
+        raise UnsupportedError("OCSP: only id-pkix-ocsp-basic is supported")
+    _t, basic, _ = der.tlv(rb_parts[1][1])
+    bparts = list(der.iter_tlv(basic))
+    if not bparts or bparts[0][0] != der.SEQUENCE:
+        raise MalformedEvidenceError("OCSP: bad BasicOCSPResponse")
+    tbs = list(der.iter_tlv(bparts[0][1]))
+    k = 1 if tbs and tbs[0][0] == 0xA0 else 0  # optional [0] EXPLICIT version
+    k += 1  # responderID ([1] byName or [2] byKey)
+    k += 1  # producedAt
+    # responses is a plain SEQUENCE OF SingleResponse
+    if k >= len(tbs) or tbs[k][0] != der.SEQUENCE:
+        raise MalformedEvidenceError("OCSP: missing responses sequence")
+    serials = []
+    for stag, sbody in der.iter_tlv(tbs[k][1]):
+        if stag != der.SEQUENCE:
+            raise MalformedEvidenceError("OCSP: bad SingleResponse")
+        sparts = list(der.iter_tlv(sbody))
+        if not sparts or sparts[0][0] != der.SEQUENCE:
+            raise MalformedEvidenceError("OCSP: bad certID")
+        certid = list(der.iter_tlv(sparts[0][1]))
+        if len(certid) < 4 or certid[3][0] != der.INTEGER:
+            raise MalformedEvidenceError("OCSP: bad certID serial")
+        serials.append(_int_value(certid[3][1]))
+    return serials

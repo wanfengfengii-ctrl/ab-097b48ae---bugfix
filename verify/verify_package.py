@@ -54,6 +54,9 @@ class ZipLoadedSet(LoadedSet):
     def _name_index_path(self) -> str:
         return ""  # unused
 
+    def _rev_index_path(self) -> str:
+        return ""  # no sidecar inside the package; headers are rescanned
+
     def _subject_name_index(self) -> dict[bytes, list[str]]:
         import base64 as b64
 
@@ -126,15 +129,17 @@ def verify_package(path: str) -> dict:
         _fail(checks, "evidence-set content digest",
               recomputed == set_manifest["content_digest"],
               {"recomputed": recomputed})
-        # bundled revocation universe equals sealed content universe
+        # Bundled revocation DER is the lazily materialized subset: every
+        # bundled object must belong to the sealed manifest; unrelated
+        # revocation DER is intentionally absent (it never enters parsing).
         bundled_crls = {n.split("/")[-1].removesuffix(".der")
                         for n in files if n.startswith("der/crls/")}
         bundled_ocsps = {n.split("/")[-1].removesuffix(".der")
                          for n in files if n.startswith("der/ocsps/")}
         sealed_crls = {x["sha256"] for x in set_manifest["content"]["crls"]}
         sealed_ocsps = {x["sha256"] for x in set_manifest["content"]["ocsps"]}
-        _fail(checks, "bundled CRL/OCSP universe equals sealed manifest",
-              bundled_crls == sealed_crls and bundled_ocsps == sealed_ocsps)
+        _fail(checks, "bundled CRL/OCSP subset of sealed manifest",
+              bundled_crls <= sealed_crls and bundled_ocsps <= sealed_ocsps)
     else:
         _fail(checks, "evidence-set content digest", False, "content absent")
 
@@ -167,20 +172,24 @@ def verify_package(path: str) -> dict:
                 continue
             name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
 
-        # The core must see exactly the sealed content universe; certificates
-        # not bundled (unrelated 100k) are irrelevant: restrict content lists
-        # to what path/revocation can reference, i.e. the packaged subset, BUT
-        # the content digest was computed over the full list. Re-running with
-        # the packaged subset is valid because path search only reaches
-        # bundled certificates (all path/proof certs are bundled).
+        # The core must see exactly the DER bundled in the package:
+        # certificates reached by path search (all path/proof certs are
+        # bundled) and the lazily materialized revocation subset. The full
+        # sealed content lists may enumerate unrelated objects (100k certs,
+        # unrelated CRLs/OCSPs) whose DER is intentionally absent; restricting
+        # the rerun universe is valid because path search only reaches bundled
+        # certificates and scope prefiltering only materializes bundled
+        # revocation DER. The content digest still references the full list.
         rerun_manifest = {
             "evidence_set_id": set_manifest["evidence_set_id"],
             "content_digest": set_manifest["content_digest"],
             "counts": set_manifest["counts"],
             "content": {
                 "certificates": sorted(cert_files),
-                "crls": set_manifest["content"]["crls"],
-                "ocsps": set_manifest["content"]["ocsps"],
+                "crls": [x for x in set_manifest["content"]["crls"]
+                         if x["sha256"] in bundled_crls],
+                "ocsps": [x for x in set_manifest["content"]["ocsps"]
+                          if x["sha256"] in bundled_ocsps],
             },
         }
         source = ZipSource(files, name_index)

@@ -11,9 +11,13 @@ BIT_STRING = 0x03
 OCTET_STRING = 0x04
 NULL = 0x05
 OID = 0x06
+BOOLEAN = 0x01
+ENUMERATED = 0x0A
 UTF8_STRING = 0x0C
 SEQUENCE = 0x30
 SET = 0x31
+UTC_TIME = 0x17
+GENERALIZED_TIME = 0x18
 
 
 def _read_len(data: bytes, i: int) -> tuple[int, int]:

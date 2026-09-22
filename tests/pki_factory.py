@@ -51,6 +51,7 @@ def build_cert(subject_cn, issuer_obj, subject_key, issuer_key, *,
                san_dns=(), san_uri=(),
                nc_permitted_dns=(), nc_excluded_dns=(),
                nc_permitted_uri=(), nc_excluded_uri=(),
+               crl_dp_uris=(),
                policies=(), policy_mappings=(),
                require_explicit_policy=None, inhibit_policy_mapping=None,
                inhibit_any_policy=None, sig_alg="sha256",
@@ -121,6 +122,13 @@ def build_cert(subject_cn, issuer_obj, subject_key, issuer_key, *,
                 [x509.UniformResourceIdentifier(u) for u in san_uri]
         builder = builder.add_extension(x509.SubjectAlternativeName(names),
                                         critical=False)
+
+    if crl_dp_uris:
+        dps = [x509.DistributionPoint(
+            full_name=[x509.UniformResourceIdentifier(u) for u in crl_dp_uris],
+            relative_name=None, reasons=None, crl_issuer=None)]
+        builder = builder.add_extension(
+            x509.CRLDistributionPoints(dps), critical=False)
 
     if nc_permitted_dns or nc_excluded_dns or nc_permitted_uri or nc_excluded_uri:
         permitted = [x509.DNSName(d) for d in nc_permitted_dns] + \
@@ -216,21 +224,11 @@ def build_crl(issuer_cert, issuer_key, entries, *,
             x509.DeltaCRLIndicator(delta_of), critical=True)
     if idp_uris or only_ca or only_user or indirect:
         full = [x509.UniformResourceIdentifier(u) for u in idp_uris] or None
-        dp = x509.DistributionPoint(full_name=full, relative_name=None,
-                                    reasons=None, crl_issuer=None)
         idp = x509.IssuingDistributionPoint(
-            full_name=None, relative_name=None,
+            full_name=full, relative_name=None,
             only_contains_user_certs=only_user, only_contains_ca_certs=only_ca,
             only_some_reasons=None, indirect_crl=indirect,
             only_contains_attribute_certs=False)
-        # cryptography's IDP needs distribution point to carry URIs: emulate
-        # by constructing via DistributionPoint full name injection.
-        if full:
-            idp = x509.IssuingDistributionPoint(
-                full_name=full, relative_name=None,
-                only_contains_user_certs=only_user, only_contains_ca_certs=only_ca,
-                only_some_reasons=None, indirect_crl=indirect,
-                only_contains_attribute_certs=False)
         builder = builder.add_extension(idp, critical=False)
     for serial, rev_epoch, reason in entries:
         rb = (x509.RevokedCertificateBuilder()
