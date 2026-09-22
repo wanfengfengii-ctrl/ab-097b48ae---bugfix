@@ -81,6 +81,15 @@ def create_app(store: Store) -> FastAPI:
         return CanonicalResponse(
             content={"status": "ok", "service": "forensic-pki", "api": "v1"})
 
+    # Process-local revocation materialization counters (see app/metrics).
+    # They start empty for each API instance, so a restart/cold process shows
+    # exactly which revocation DERs were fully parsed.
+    @app.get("/internal/metrics")
+    async def internal_metrics():
+        from . import metrics as _metrics
+
+        return {"revocation_materialization": _metrics.snapshot()}
+
     # ------------------------------------------------------ evidence sets
     @app.post("/api/v1/evidence-sets", status_code=201)
     async def create_set(body: dict = None, idempotency_key: str | None = Header(default=None)):

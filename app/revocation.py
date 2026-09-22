@@ -60,10 +60,12 @@ class RevocationEngine:
     the graph/adjudication layer.
     """
 
-    def __init__(self, crls: dict[str, ev.CrlObject], ocsps: dict[str, ev.OcspObject],
-                 cert_loader, anchors_by_name_key, signed_at: int, cutoff: int):
-        self.crls = crls
-        self.ocsps = ocsps
+    def __init__(self, loaded, cert_loader, anchors_by_name_key,
+                 signed_at: int, cutoff: int):
+        # Revocation objects are materialized lazily through the loader: only
+        # CRLs whose issuer/AKI scope a certificate under evaluation and OCSP
+        # responses carrying its serial are ever DER-parsed.
+        self.loaded = loaded
         self.load_cert = cert_loader
         self.anchors_by_name_key = anchors_by_name_key  # (name_der, key) -> ParsedCert
         self.signed_at = signed_at
@@ -132,13 +134,12 @@ class RevocationEngine:
         return entries
 
     def _crl_candidates(self, cert: ParsedCert):
-        """Yield (combo_key, base, delta|None, entries, scope_reason)."""
+        """Yield (base, delta|None) combos for every in-scope complete CRL.
+
+        The loader has already applied the cheap issuer-Name/AKI pre-filter
+        (and materialized those CRLs), so no unrelated CRL DER is parsed."""
         bases, deltas = [], []
-        for crl in self.crls.values():
-            if crl.issuer_der != cert.issuer_der:
-                continue
-            if crl.aki and cert.aki and crl.aki != cert.aki:
-                continue
+        for crl in self.loaded.crl_candidates_for(cert):
             (bases if not crl.is_delta else deltas).append(crl)
         combos = []
         for base in bases:
@@ -322,7 +323,7 @@ class RevocationEngine:
         scope_candidates = 0
         crypto_failures = 0
         stale_any = False
-        for resp in self.ocsps.values():
+        for resp in self.loaded.ocsp_candidates_for(cert):
             single = resp.responses.get(cert.serial)
             if single is None:
                 continue

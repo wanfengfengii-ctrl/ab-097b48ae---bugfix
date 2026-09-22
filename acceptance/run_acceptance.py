@@ -250,6 +250,118 @@ def main() -> int:
     check("out-of-profile P-384 -> structured UNSUPPORTED",
           r.status_code == 422 and r.json()["error"]["code"] == "UNSUPPORTED")
 
+    # ---------------- lazy revocation materialization ---------------------
+    # A sealed set archives 48 legal GOOD CRLs issued by a Noise CA that has
+    # no scope relationship to the target chain. A cold process (the other API
+    # instance, which has never touched this set) and an uncached follow-up
+    # adjudication must not parse any of those unrelated CRLs, while the
+    # target chain still adjudicates VALID.
+    N_NOISE = 48
+    nrk, nck, nlk = pf.gen_key(), pf.gen_key(), pf.gen_key()
+    nroot = pf.build_cert("Lazy Root", None, nrk, nrk, is_ca=True,
+                          key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                          self_signed=True)
+    nca = pf.build_cert("Lazy CA", nroot, nck, nrk, is_ca=True,
+                        key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+    nleaf = pf.build_cert("artifact.lazy.test", nca, nlk, nck,
+                          key_usage=("digitalSignature",),
+                          eku=("codeSigning",), policies=[ANY],
+                          san_dns=("artifact.lazy.test",))
+    n_crl = pf.build_crl(nca, nck, [], last_update=SIGNED - 100,
+                         next_update=SIGNED + 100, crl_number=1)
+    n_rcrl = pf.build_crl(nroot, nrk, [], last_update=SIGNED - 100,
+                          next_update=SIGNED + 100, crl_number=1)
+    nk = pf.gen_key()
+    noise_ca = pf.build_cert("Noise CA", None, nk, nk, is_ca=True,
+                             key_usage=("keyCertSign", "cRLSign"),
+                             policies=[ANY], self_signed=True)
+    r = httpx.post(API1 + "/api/v1/evidence-sets",
+                   json={"client_request_id": "lazy-create"})
+    lsid = r.json()["evidence_set_id"]
+    lazy_items = [
+        {"client_ref": "nroot", "type": "certificate", "content_base64": b64(nroot)},
+        {"client_ref": "nca", "type": "certificate", "content_base64": b64(nca)},
+        {"client_ref": "nleaf", "type": "certificate", "content_base64": b64(nleaf)},
+        {"client_ref": "noise-ca", "type": "certificate",
+         "content_base64": b64(noise_ca)},
+        {"client_ref": "n-crl", "type": "crl", "content_base64": b64(n_crl)},
+        {"client_ref": "n-rcrl", "type": "crl", "content_base64": b64(n_rcrl)},
+    ]
+    for i in range(N_NOISE):
+        c = pf.build_crl(noise_ca, nk, [], last_update=SIGNED - 200 + i,
+                         next_update=SIGNED + 50_000 + i, crl_number=i + 1)
+        lazy_items.append({"client_ref": f"noise-crl-{i}", "type": "crl",
+                           "content_base64": b64(c)})
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{lsid}/items",
+                   json={"client_request_id": "lazy-items",
+                         "received_at": RECEIVED, "items": lazy_items})
+    check("lazy set: upload target chain + 48 noise CRLs",
+          r.status_code == 200 and r.json()["accepted"] == 6 + N_NOISE)
+    noise_fps = {it["sha256"] for it in r.json()["items"]
+                 if it["client_ref"].startswith("noise-crl-")}
+    target_crl_fps = {fp_of(pf.der(n_crl)), fp_of(pf.der(n_rcrl))}
+    r = httpx.post(f"{API1}/api/v1/evidence-sets/{lsid}/seal",
+                   json={"client_request_id": "lazy-seal"})
+    check("lazy set sealed", r.status_code == 200
+          and r.json()["state"] == "sealed")
+
+    nartifact = b"lazy-artifact"
+    ndigest = hashlib.sha256(nartifact).digest()
+    nsig = nlk.sign(ndigest, ec.ECDSA(Prehashed(hashes.SHA256())))
+
+    def lazy_adj(rid, signed=SIGNED, art=nartifact):
+        dg = hashlib.sha256(art).digest()
+        sg = nlk.sign(dg, ec.ECDSA(Prehashed(hashes.SHA256())))
+        return {"client_request_id": rid, "artifact_digest": dg.hex(),
+                "signature": sg.hex(),
+                "signature_algorithm": "1.2.840.10045.4.3.2",
+                "signed_at": signed, "knowledge_cutoff": CUTOFF,
+                "leaf_certificate_sha256": fp_of(pf.der(nleaf)),
+                "initial_policies": [ANY],
+                "trust_anchors": [fp_of(pf.der(nroot))]}
+
+    def parsed_on(base_url):
+        rr = httpx.get(base_url + "/internal/metrics")
+        if rr.status_code != 200:
+            return None
+        return set(rr.json()["revocation_materialization"]
+                   .get(lsid, {}).get("crl_full_parsed", []))
+
+    # Cold process: api2 has never touched this set (separate process sharing
+    # the sealed volume). First adjudication there must not parse noise CRLs.
+    r = httpx.post(f"{API2}/api/v1/evidence-sets/{lsid}/adjudications",
+                   json=lazy_adj("lazy-adj-cold"))
+    cold_ok = r.status_code == 201 and r.json()["verdict"]["status"] == "VALID"
+    check("cold instance adjudicates lazy set VALID", cold_ok, r.text[:200])
+    parsed_cold = parsed_on(API2)
+    check("cold instance parses zero of 48 unrelated noise CRLs",
+          parsed_cold is not None and not (parsed_cold & noise_fps),
+          "" if parsed_cold is None else
+          f"noise parsed: {len(parsed_cold & noise_fps)}")
+    check("cold instance parses the in-scope target CRLs",
+          parsed_cold is not None and target_crl_fps <= parsed_cold)
+
+    # Uncached second adjudication (new request digest) on the same cold
+    # instance: still no noise CRL materialization.
+    r = httpx.post(f"{API2}/api/v1/evidence-sets/{lsid}/adjudications",
+                   json=lazy_adj("lazy-adj-uncached", signed=SIGNED + 10,
+                                art=b"lazy-artifact-two"))
+    uncached_ok = r.status_code == 201 and r.json()["verdict"]["status"] == "VALID"
+    check("uncached follow-up adjudication VALID", uncached_ok, r.text[:200])
+    parsed_again = parsed_on(API2)
+    check("uncached adjudication parses zero noise CRLs",
+          parsed_again is not None and not (parsed_again & noise_fps))
+
+    # Target-chain evidence dispositions name only in-scope CRLs.
+    if cold_ok:
+        considered = set()
+        for snap in r.json()["revocation_snapshot"]:
+            for c in snap["considered_evidence"]:
+                if c["kind"] in ("crl", "delta_crl"):
+                    considered.add(c["fingerprint"])
+        check("considered evidence excludes all noise CRLs",
+              not (considered & noise_fps))
+
     print("-" * 64)
     failed = [x for x in results if x[0] == FAIL]
     print(f"acceptance: {len(results) - len(failed)}/{len(results)} passed")

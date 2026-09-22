@@ -48,6 +48,60 @@ def sha256(b: bytes) -> bytes:
 
 
 @dataclasses.dataclass
+class CrlScope:
+    """The minimal identity/scope of a CRL needed to decide, in a cold
+    process, whether it can possibly concern a certificate: the issuer Name
+    and AKI (the exact pre-filter the revocation engine applies). Derived
+    from a fully parsed object at seal time and stored in the sidecar."""
+    issuer_name: bytes
+    aki: bytes | None
+
+
+@dataclasses.dataclass
+class OcspScope:
+    """The minimal OCSP scope: the serial numbers the response answers
+    (its CertIDs). A response that says nothing about a certificate's serial
+    can never enter its revocation disposition."""
+    serials: frozenset[int]
+
+
+def crl_scope_from_obj(obj: "CrlObject") -> CrlScope:
+    return CrlScope(issuer_name=obj.issuer_der, aki=obj.aki)
+
+
+def ocsp_scope_from_obj(obj: "OcspObject") -> OcspScope:
+    return OcspScope(serials=frozenset(obj.responses))
+
+
+def review_crl(raw: bytes, received_at: int) -> tuple["CrlObject | None", dict | None]:
+    """Run the full profile parse once. Returns ``(obj, None)`` when the CRL is
+    in profile, or ``(None, {code,message,detail})`` when it must be recorded
+    as parse-rejected evidence. (Seal has already x509-loaded each CRL for the
+    entry-count limit, so structurally unloadable DER never reaches here.)"""
+    try:
+        return parse_crl(raw, received_at), None
+    except (UnsupportedError, MalformedEvidenceError) as exc:
+        return None, {"code": exc.code, "message": exc.message,
+                      "detail": exc.detail}
+    except Exception as exc:  # defensive: never crash the seal over one object
+        return None, {"code": "MALFORMED_EVIDENCE",
+                      "message": f"{type(exc).__name__}: {exc}"[:200],
+                      "detail": {}}
+
+
+def review_ocsp(raw: bytes, received_at: int) -> tuple["OcspObject | None", dict | None]:
+    try:
+        return parse_ocsp(raw, received_at), None
+    except (UnsupportedError, MalformedEvidenceError) as exc:
+        return None, {"code": exc.code, "message": exc.message,
+                      "detail": exc.detail}
+    except Exception as exc:
+        return None, {"code": "MALFORMED_EVIDENCE",
+                      "message": f"{type(exc).__name__}: {exc}"[:200],
+                      "detail": {}}
+
+
+@dataclasses.dataclass
 class RevokedEntry:
     serial: int
     revocation_date: int
@@ -182,9 +236,9 @@ def parse_crl(raw: bytes, received_at: int) -> CrlObject:
             # represented, entries outside the subset would be authoritative
             # for their reasons. Profile keeps full-scope CRLs only.
             raise UnsupportedError("CRL with onlySomeReasons partition is outside profile")
-        if idp.distribution_point is not None and idp.distribution_point.full_name:
+        if idp.full_name:
             uris = []
-            for gn in idp.distribution_point.full_name:
+            for gn in idp.full_name:
                 if isinstance(gn, x509.UniformResourceIdentifier):
                     uris.append(gn.value.lower())
                 else:

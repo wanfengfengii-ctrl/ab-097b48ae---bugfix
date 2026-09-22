@@ -288,12 +288,49 @@ class Store:
                     except MalformedEvidenceError:
                         continue
                     name_index.setdefault(base64.b64encode(subject).decode(), []).append(d)
+                # Revocation scope + profile-verdict index, built once at seal
+                # by fully parsing each object. A cold process later reads
+                # only this sidecar to bound scope, so unrelated revocation
+                # DERs need never be re-read/re-parsed after restart.
+                import base64 as _b64
+
+                from cryptography import x509 as _x509
+
+                from . import evidence as _ev
+                from .loader import REV_INDEX_VERSION
+
+                rev_index = {"version": REV_INDEX_VERSION, "crls": [], "ocsps": []}
                 total_revocation_entries = 0
                 for x in groups["crl"]:
-                    from cryptography import x509 as _x509
-
+                    digest = x["sha256"]
+                    raw = self.get_blob(digest)
+                    # Entry-count resource limit (a structurally unloadable
+                    # CRL fails here, exactly as before lazy materialization).
                     total_revocation_entries += len(
-                        _x509.load_der_x509_crl(self.get_blob(x["sha256"])))
+                        _x509.load_der_x509_crl(raw))
+                    obj, problem = _ev.review_crl(raw, x["received_at"])
+                    if problem is not None:
+                        rev_index["crls"].append(
+                            {"s": digest, "i": None, "a": None, "e": 1,
+                             "p": problem})
+                    else:
+                        scope = _ev.crl_scope_from_obj(obj)
+                        rev_index["crls"].append({
+                            "s": digest,
+                            "i": _b64.b64encode(scope.issuer_name).decode(),
+                            "a": _b64.b64encode(scope.aki).decode()
+                            if scope.aki is not None else None, "e": 0})
+                for x in groups["ocsp"]:
+                    digest = x["sha256"]
+                    obj, problem = _ev.review_ocsp(
+                        self.get_blob(digest), x["received_at"])
+                    if problem is not None:
+                        rev_index["ocsps"].append(
+                            {"s": digest, "n": None, "e": 1, "p": problem})
+                    else:
+                        scope = _ev.ocsp_scope_from_obj(obj)
+                        rev_index["ocsps"].append(
+                            {"s": digest, "n": sorted(scope.serials), "e": 0})
                 if total_revocation_entries > 1_000_000:
                     raise ConflictError("resource limit exceeded",
                                         {"limit": "revocation_entries", "max": 1_000_000,
@@ -328,6 +365,13 @@ class Store:
                 with open(tmp, "w") as f:
                     f.write(canonical.dumps(name_index).decode("utf-8"))
                 _os.replace(tmp, idx_path)
+                # Revocation scope index sidecar (lazy materialization).
+                rev_path = _os.path.join(
+                    self.root, "packages", f"{set_id}.revindex.json")
+                tmp = rev_path + ".tmp"
+                with open(tmp, "w") as f:
+                    f.write(canonical.dumps(rev_index).decode("utf-8"))
+                _os.replace(tmp, rev_path)
                 return manifest
             except Exception:
                 self._conn.rollback()
